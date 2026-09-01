@@ -1,0 +1,100 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "basis"
+version = "0.1.0"
+description = "Shared platform substrate for AI-led delivery: run context, model gateway, tool governance, memory, observability."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+
+# Core stays deliberately light so a consumer that only wants tool governance,
+# run context or redaction does not drag Bedrock/Strands into its lockfile.
+# psycopg 3 (not psycopg2) because ai-core/parser runs Python 3.14, where
+# psycopg2-binary has no wheels; 3.x also gives us a real connection pool.
+dependencies = [
+    "psycopg[binary,pool]>=3.2",
+]
+
+[project.optional-dependencies]
+# The Bedrock/Strands model path. Pinned loosely; AILedSDLC/agent pins
+# strands-agents==1.38.0 and that is the version this was lifted from.
+bedrock = [
+    "strands-agents>=1.38.0",
+    "boto3>=1.35",
+    "botocore>=1.35",
+]
+otel = [
+    "opentelemetry-sdk>=1.41.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.41.1",
+    "opentelemetry-sdk-extension-aws>=2.0.2",
+    "opentelemetry-propagator-aws-xray>=1.0.2",
+]
+http = [
+    "httpx>=0.28.1",
+]
+all = ["basis[bedrock,otel,http]"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/basis"]
+# PEP 561: without this marker a consumer's mypy/pyright ignores every
+# annotation in the package, which for a fully-typed package is a silent loss.
+artifacts = ["src/basis/py.typed"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/basis", "migrations", "tests", "README.md", "CHANGELOG.md", "LICENSE"]
+
+[tool.ruff]
+line-length = 90
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = [
+    # Long lines in prose comments and SQL are deliberate; the code itself
+    # stays inside the limit.
+    "E501",
+    # `%`-formatting is used throughout rather than f-strings, so log calls and
+    # exception messages read the same way and lazy log formatting works.
+    "UP031", "UP032",
+    # `class X(str, Enum)` rather than `StrEnum`. These values are persisted in
+    # Postgres and compared against raw strings from the DB, and the two bases
+    # differ in what `str(member)` returns - so the choice is load-bearing, not
+    # stylistic. Every call site uses `.value` explicitly.
+    "UP042",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert on private helpers and re-import inside functions on purpose.
+"tests/*" = ["B011", "SIM117"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/basis"]
+ignore_missing_imports = true
+# Not `strict`. The Strands / boto surfaces are untyped and the storage layer
+# deliberately passes `Any` rows around, so strict mode would produce noise
+# rather than findings. These are the checks that catch real mistakes.
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["strands.*", "botocore.*", "boto3.*", "psycopg_pool.*", "opentelemetry.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: requires a live Postgres or AWS credentials; skipped unless INTEGRATION_TESTS=1",
+]
