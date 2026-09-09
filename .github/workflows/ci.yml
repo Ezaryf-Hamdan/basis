@@ -1,0 +1,77 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in pyproject and the version ai-core runs.
+        python: ["3.11", "3.12", "3.13", "3.14"]
+
+    services:
+      postgres:
+        # pgvector is not optional: the retrieval and memory tests need it.
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: basis_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install
+        run: python -m pip install -e ".[dev,otel,http]"
+
+      - name: Lint
+        run: python -m pip install ruff && ruff check src tests
+
+      - name: Type check
+        run: python -m pip install mypy && mypy src/basis
+
+      - name: Unit tests
+        run: python -m pytest -q
+
+      - name: Apply migrations
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d basis_test -v ON_ERROR_STOP=1 \
+            -f migrations/0000_basis_baseline.sql
+          psql -h localhost -U postgres -d basis_test -v ON_ERROR_STOP=1 \
+            -f migrations/0002_basis_platform.sql
+
+      - name: Integration tests
+        env:
+          INTEGRATION_TESTS: "1"
+          BASIS_TEST_DSN: postgresql://postgres:postgres@localhost:5432/basis_test
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/basis_test
+        run: python -m pytest -q -m integration
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install build && python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
