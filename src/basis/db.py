@@ -78,6 +78,10 @@ def _get_pool(dsn: str) -> Any:
                 min_size=cfg.pool_min_size,
                 max_size=cfg.pool_max_size,
                 timeout=cfg.pool_timeout,
+                # Reconnect after a DB restart rather than returning broken
+                # connections. Without this, a pool open before a restart silently
+                # returns connections that fail on first use with no retry.
+                reconnect_timeout=cfg.pool_reconnect_timeout,
                 # open=False + explicit open() keeps import side-effect-free and
                 # surfaces a bad DSN at first use rather than at construction.
                 open=False,

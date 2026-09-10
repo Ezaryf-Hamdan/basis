@@ -68,6 +68,7 @@ class Settings:
     pool_min_size: int = 1
     pool_max_size: int = 10
     pool_timeout: float = 30.0
+    pool_reconnect_timeout: float = 10.0
 
     # Model resolution cache TTL in seconds. model_config.get_model() read the
     # DB on EVERY call ("Reads DB on every call (no cache)"), so one job that
@@ -104,6 +105,9 @@ class Settings:
             pool_min_size=_int("BASIS_POOL_MIN_SIZE", 1),
             pool_max_size=_int("BASIS_POOL_MAX_SIZE", 10),
             pool_timeout=float(os.environ.get("BASIS_POOL_TIMEOUT", "30")),
+            pool_reconnect_timeout=float(
+                os.environ.get("BASIS_POOL_RECONNECT_TIMEOUT", "10")
+            ),
             model_config_ttl_seconds=_int("BASIS_MODEL_CONFIG_TTL", 30),
             default_model_id=os.environ.get(
                 "BASIS_DEFAULT_MODEL_ID", "us.anthropic.claude-opus-5"
