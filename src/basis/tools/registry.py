@@ -160,16 +160,27 @@ class ToolRegistry:
         *,
         ctx: RunContext | None = None,
         scope: str | None = None,
+        use_grants: bool = True,
     ) -> None:
         """Assert a tool is permitted, or raise ToolDenied.
 
         A second line of defence behind ``tools_for``. If a tool is reached by
         some path that skipped the filter, this makes it loud. The original had
         no equivalent - a policy bypass would simply have worked.
+
+        ``use_grants`` must match what was passed to ``tools_for`` for this
+        run. They are separate arguments because they are separate calls, but
+        disagreeing is always a bug: filtering with ``use_grants=False`` and
+        then checking with grants on denies tools the agent was handed, which
+        surfaces as a tool that exists but always fails.
         """
         run = ctx if ctx is not None else require_context()
         effective_scope = scope if scope is not None else run.task_key
-        granted = self.grants_for(tenant_id=run.tenant_id, persona_id=run.persona_id)
+        granted = (
+            self.grants_for(tenant_id=run.tenant_id, persona_id=run.persona_id)
+            if use_grants
+            else None
+        )
         reason = self.policy.denied_reason(
             tool_name, scope=effective_scope, granted=granted
         )
@@ -242,11 +253,15 @@ class ToolRegistry:
         *args: Any,
         ctx: RunContext | None = None,
         scope: str | None = None,
+        use_grants: bool = True,
         **kwargs: Any,
     ) -> Any:
-        """Check, run, and audit a tool call in one place."""
+        """Check, run, and audit a tool call in one place.
+
+        Pass the same ``use_grants`` value used for ``tools_for`` on this run.
+        """
         run = ctx if ctx is not None else require_context()
-        self.check(tool_name, ctx=run, scope=scope)
+        self.check(tool_name, ctx=run, scope=scope, use_grants=use_grants)
         started = time.monotonic()
         try:
             result = fn(*args, **kwargs)
