@@ -70,8 +70,15 @@ class InMemoryMemoryRepository:
         self.long: list[dict[str, Any]] = []
 
     def write_short_term(
-        self, scope: Any, note_type: str, content: str, metadata: Mapping[str, Any]
+        self,
+        scope: Any,
+        note_type: str,
+        content: str,
+        metadata: Mapping[str, Any],
+        *,
+        expires_at: Any = None,
     ) -> str:
+
         note_id = str(uuid.uuid4())
         self.short.append(
             {
@@ -85,11 +92,13 @@ class InMemoryMemoryRepository:
                 "content": content,
                 "metadata": dict(metadata or {}),
                 "created_at": _now(),
+                "expires_at": expires_at,
             }
         )
         return note_id
 
     def _short_matches(self, scope: Any) -> list[dict[str, Any]]:
+        now = _now()
         job = scope.require_job()
         return [
             n
@@ -97,6 +106,7 @@ class InMemoryMemoryRepository:
             if n["tenant_id"] == scope.tenant_id
             and n["job_id"] == job
             and n["persona_id"] == scope.persona_id
+            and (n.get("expires_at") is None or n["expires_at"] > now)
         ]
 
     def read_short_term(self, scope: Any) -> list[dict[str, Any]]:
@@ -109,6 +119,28 @@ class InMemoryMemoryRepository:
         before = len(self.short)
         self.short = [n for n in self.short if n["id"] not in doomed]
         return before - len(self.short)
+
+    def prune_short_term(self, *, tenant_id: str) -> int:
+        now = _now()
+        before = len(self.short)
+        self.short = [
+            n for n in self.short
+            if not (n["tenant_id"] == tenant_id
+                    and n.get("expires_at") is not None
+                    and n["expires_at"] < now)
+        ]
+        return before - len(self.short)
+
+    def prune_expired(self, *, tenant_id: str, retain_days: int) -> int:
+        from datetime import timedelta
+
+        cutoff = _now() - timedelta(days=retain_days)
+        before = len(self.long)
+        self.long = [
+            m for m in self.long
+            if not (m["tenant_id"] == tenant_id and m["created_at"] < cutoff)
+        ]
+        return before - len(self.long)
 
     def write_long_term(
         self,
@@ -149,10 +181,10 @@ class InMemoryMemoryRepository:
         limit: int,
         min_importance: float,
         importance_weight: float,
+        query_text: str | None = None,
     ) -> list[dict[str, Any]]:
-        # The tenant predicate is applied here, exactly as the SQL applies it -
-        # an in-memory backend that filtered loosely would hide isolation bugs
-        # that the Postgres one catches.
+        # Tenant predicate applied identically to the SQL arm — loose filtering
+        # here would hide isolation bugs the Postgres backend catches.
         rows = [
             m
             for m in self.long
@@ -163,15 +195,58 @@ class InMemoryMemoryRepository:
             and m["importance"] >= min_importance
         ]
 
+        if query_embedding is not None and query_text:
+            # RRF: vector arm + word-overlap text arm
+            words = set(query_text.lower().split())
+            k = 60
+
+            vec_scored = []
+            for m in rows:
+                if not m["embedding"]:
+                    continue
+                d = _cosine_distance(query_embedding, m["embedding"])
+                vec_scored.append((m["id"], d))
+            vec_scored.sort(key=lambda x: x[1])
+            vec_rank = {mid: i + 1 for i, (mid, _) in enumerate(vec_scored)}
+
+            txt_scored = []
+            for m in rows:
+                overlap = len(words & set(m["content"].lower().split()))
+                if overlap:
+                    txt_scored.append((m["id"], overlap))
+            txt_scored.sort(key=lambda x: -x[1])
+            txt_rank = {mid: i + 1 for i, (mid, _) in enumerate(txt_scored)}
+
+            all_ids = {m["id"] for m in rows if m["id"] in vec_rank or m["id"] in txt_rank}
+            rrf: list[tuple[Any, float]] = []
+            for mid in all_ids:
+                score = 0.0
+                if mid in vec_rank:
+                    score += 1.0 / (k + vec_rank[mid])
+                if mid in txt_rank:
+                    score += 1.0 / (k + txt_rank[mid])
+                rrf.append((mid, score))
+            rrf.sort(key=lambda x: -x[1])
+
+            by_id = {m["id"]: m for m in rows}
+            out = []
+            for mid, score in rrf[:limit]:
+                row = dict(by_id[mid])
+                row["distance"] = None
+                row["score"] = score
+                out.append(row)
+            return out
+
         if query_embedding is not None:
             scored = []
             for m in rows:
                 if not m["embedding"]:
                     continue
                 distance = _cosine_distance(query_embedding, m["embedding"])
-                score = (1.0 - distance) * (1.0 - importance_weight) + m[
-                    "importance"
-                ] * importance_weight
+                score = (
+                    (1.0 - distance) * (1.0 - importance_weight)
+                    + m["importance"] * importance_weight
+                )
                 out = dict(m)
                 out["distance"] = distance
                 out["score"] = score
@@ -179,10 +254,7 @@ class InMemoryMemoryRepository:
             scored.sort(key=lambda m: -m["score"])
             return scored[:limit]
 
-        rows = sorted(
-            rows, key=lambda m: (-m["importance"], m["created_at"]), reverse=False
-        )
-        rows.sort(key=lambda m: -m["importance"])
+        rows = sorted(rows, key=lambda m: (-m["importance"], m["created_at"]))
         out_rows = []
         for m in rows[:limit]:
             row = dict(m)

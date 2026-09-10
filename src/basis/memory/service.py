@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ..storage import MemoryRepository
@@ -66,9 +67,23 @@ class MemoryService:
         note_type: str,
         content: str,
         metadata: dict[str, Any] | None = None,
+        *,
+        ttl_seconds: int | None = None,
     ) -> str:
-        """Append a scratch note for the current job."""
-        return self._repo.write_short_term(scope, note_type, content, metadata or {})
+        """Append a scratch note for the current job.
+
+        ``ttl_seconds`` sets an expiry so old notes are invisible after that
+        window without requiring an explicit ``clear_short_term`` call. Useful
+        for notes that are only relevant within a single turn.
+        """
+        expires_at = (
+            datetime.now(UTC) + timedelta(seconds=ttl_seconds)
+            if ttl_seconds is not None
+            else None
+        )
+        return self._repo.write_short_term(
+            scope, note_type, content, metadata or {}, expires_at=expires_at
+        )
 
     def read_short_term(self, scope: MemoryScope) -> list[dict[str, Any]]:
         """Scratch notes for this (job, persona), oldest first."""
@@ -113,6 +128,7 @@ class MemoryService:
         scope: MemoryScope,
         *,
         query_embedding: Sequence[float] | None = None,
+        query_text: str | None = None,
         limit: int = 10,
         min_importance: float = 0.0,
         importance_weight: float = 0.25,
@@ -121,18 +137,18 @@ class MemoryService:
         """Retrieve relevant memories.
 
         With ``query_embedding``, ranks by cosine distance blended with
-        importance; without one, falls back to importance ordering. The blend
-        keeps a highly-important memory reachable even when it is not the
-        closest match, which is the behaviour the importance-only ordering was
-        reaching for.
+        importance. When ``query_text`` is also supplied, vector and full-text
+        arms are fused via Reciprocal Rank Fusion — the same approach used by
+        knowledge retrieval. Providing both produces the best recall on short,
+        keyword-heavy queries that cosine distance alone misses.
 
         ``distance`` and ``score`` are returned so a caller can threshold or
-        rerank - the source had no reranker anywhere, and exposing the distance
-        is the minimum needed to build one.
+        rerank.
         """
         rows = self._repo.recall(
             scope,
             query_embedding=query_embedding,
+            query_text=query_text,
             limit=limit,
             min_importance=min_importance,
             importance_weight=importance_weight,
@@ -142,6 +158,21 @@ class MemoryService:
             try:
                 self._repo.record_access(scope, [r["id"] for r in rows])
             except Exception as exc:
-                # Bookkeeping must never fail a recall.
                 log.warning("memory access bookkeeping failed: %s", exc)
         return rows
+
+    def prune_short_term(self, scope: MemoryScope) -> int:
+        """Delete expired short-term notes for this tenant.
+
+        Idempotent. Run periodically (e.g. at job start) to keep the table
+        from accumulating notes whose TTL has passed.
+        """
+        return self._repo.prune_short_term(tenant_id=scope.tenant_id)
+
+    def prune_expired(self, scope: MemoryScope, *, retain_days: int = 90) -> int:
+        """Delete long-term memories older than ``retain_days`` for this tenant.
+
+        Does not delete memories regardless of age — ``retain_days`` is a
+        floor, not a ceiling. Run as a maintenance task, not on every request.
+        """
+        return self._repo.prune_expired(tenant_id=scope.tenant_id, retain_days=retain_days)

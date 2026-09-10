@@ -27,6 +27,7 @@ from .context import (
 from .errors import (
     AuthorizationDenied,
     BasisError,
+    ConcurrentModificationError,
     ConfigurationError,
     DelegationExpired,
     ModelUnavailable,
@@ -40,6 +41,7 @@ __version__ = "0.1.0"
 __all__ = [
     "AuthorizationDenied",
     "BasisError",
+    "ConcurrentModificationError",
     "ConfigurationError",
     "DelegationExpired",
     "ModelUnavailable",

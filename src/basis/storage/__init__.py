@@ -90,7 +90,13 @@ class MemoryRepository(Protocol):
     """Short-term scratch notes and long-term memories."""
 
     def write_short_term(
-        self, scope: Any, note_type: str, content: str, metadata: Mapping[str, Any]
+        self,
+        scope: Any,
+        note_type: str,
+        content: str,
+        metadata: Mapping[str, Any],
+        *,
+        expires_at: Any = None,
     ) -> str: ...
 
     def read_short_term(self, scope: Any) -> list[dict[str, Any]]: ...
@@ -117,9 +123,14 @@ class MemoryRepository(Protocol):
         limit: int,
         min_importance: float,
         importance_weight: float,
+        query_text: str | None = None,
     ) -> list[dict[str, Any]]: ...
 
     def record_access(self, scope: Any, memory_ids: Sequence[str]) -> None: ...
+
+    def prune_short_term(self, *, tenant_id: str) -> int: ...
+
+    def prune_expired(self, *, tenant_id: str, retain_days: int) -> int: ...
 
 
 @runtime_checkable

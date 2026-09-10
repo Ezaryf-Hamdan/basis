@@ -112,6 +112,11 @@ class RunRecord:
     error: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    # Monotone counter incremented on every save_run. Used by PgWorkflowRepository
+    # for optimistic locking: a concurrent writer that loaded an older version
+    # loses the race and gets ConcurrentModificationError rather than silently
+    # overwriting checkpoint data.
+    version: int = 1
 
     def step(self, step_id: str) -> StepRecord:
         record = self.steps.get(step_id)

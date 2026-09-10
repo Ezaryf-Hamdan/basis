@@ -101,3 +101,23 @@ class ModelUnavailable(BasisError):
             f"no model succeeded for task_key={task_key!r} after {attempts} attempt(s)"
             + (f": {last_error}" if last_error else "")
         )
+
+
+class ConcurrentModificationError(BasisError):
+    """A write was refused because another writer modified the record first.
+
+    Raised by `PgWorkflowRepository.save_run` when the row's version has
+    advanced since the record was loaded. The caller must reload and retry
+    rather than blindly overwriting — silently clobbering a concurrent update
+    would lose checkpoint data from a parallel engine instance.
+    """
+
+    def __init__(self, resource: str, id: str):
+        self.resource = resource
+        self.id = id
+        super().__init__(
+            f"{resource} {id!r} was modified concurrently; reload and retry"
+        )
+
+    def marker(self) -> str:
+        return f"concurrent_modification: {self}"

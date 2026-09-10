@@ -61,15 +61,21 @@ class _PgBase:
 
 class PgMemoryRepository(_PgBase):
     def write_short_term(
-        self, scope: Any, note_type: str, content: str, metadata: Mapping[str, Any]
+        self,
+        scope: Any,
+        note_type: str,
+        content: str,
+        metadata: Mapping[str, Any],
+        *,
+        expires_at: datetime | None = None,
     ) -> str:
         note_id = str(uuid.uuid4())
         db.execute(
             f"""
             INSERT INTO {self.t.short_term}
               (id, tenant_id, job_id, run_id, persona_id, user_id, project_id,
-               note_type, content, metadata)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+               note_type, content, metadata, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
             """,
             (
                 note_id,
@@ -82,6 +88,7 @@ class PgMemoryRepository(_PgBase):
                 note_type,
                 content,
                 json.dumps(dict(metadata or {})),
+                expires_at,
             ),
             dsn=self._dsn,
         )
@@ -93,6 +100,7 @@ class PgMemoryRepository(_PgBase):
             SELECT id, note_type, content, metadata, created_at
             FROM {self.t.short_term}
             WHERE tenant_id = %s AND job_id = %s AND persona_id = %s
+              AND (expires_at IS NULL OR expires_at > NOW())
             ORDER BY created_at
             """,
             (scope.tenant_id, scope.require_job(), scope.persona_id),
@@ -104,6 +112,27 @@ class PgMemoryRepository(_PgBase):
             f"DELETE FROM {self.t.short_term} "
             "WHERE tenant_id = %s AND job_id = %s AND persona_id = %s",
             (scope.tenant_id, scope.require_job(), scope.persona_id),
+            dsn=self._dsn,
+        )
+
+    def prune_short_term(self, *, tenant_id: str) -> int:
+        """Delete expired short-term notes for a tenant."""
+        return db.execute(
+            f"DELETE FROM {self.t.short_term} "
+            "WHERE tenant_id = %s AND expires_at IS NOT NULL AND expires_at < NOW()",
+            (tenant_id,),
+            dsn=self._dsn,
+        )
+
+    def prune_expired(self, *, tenant_id: str, retain_days: int) -> int:
+        """Delete long-term memories older than retain_days for a tenant."""
+        return db.execute(
+            f"""
+            DELETE FROM {self.t.memories}
+            WHERE tenant_id = %s
+              AND created_at < NOW() - MAKE_INTERVAL(days => %s)
+            """,
+            (tenant_id, retain_days),
             dsn=self._dsn,
         )
 
@@ -154,7 +183,75 @@ class PgMemoryRepository(_PgBase):
         limit: int,
         min_importance: float,
         importance_weight: float,
+        query_text: str | None = None,
     ) -> list[dict[str, Any]]:
+        scope_pred = (
+            "tenant_id = %(tenant)s AND user_id = %(user)s "
+            "AND project_id = %(project)s AND persona_id = %(persona)s "
+            "AND importance >= %(min_importance)s"
+        )
+        base_params: dict[str, Any] = {
+            "tenant": scope.tenant_id,
+            "user": scope.user_id,
+            "project": scope.project_id,
+            "persona": scope.persona_id,
+            "min_importance": min_importance,
+            "limit": limit,
+            "k": 60,  # RRF constant
+        }
+
+        if query_embedding is not None and query_text:
+            # Hybrid: vector arm + full-text arm fused by Reciprocal Rank Fusion.
+            # Both arms are already scope-filtered so the outer join needs no
+            # additional predicate. Falls back to vector-only if the tsv column
+            # is absent (pre-migration databases).
+            try:
+                return db.query_all(
+                    f"""
+                    WITH vec AS (
+                        SELECT id,
+                               row_number() OVER (
+                                   ORDER BY embedding <=> %(qvec)s::vector
+                               ) AS rank
+                        FROM {self.t.memories}
+                        WHERE {scope_pred} AND embedding IS NOT NULL
+                        ORDER BY embedding <=> %(qvec)s::vector
+                        LIMIT %(limit)s
+                    ),
+                    txt AS (
+                        SELECT id,
+                               row_number() OVER (
+                                   ORDER BY ts_rank(
+                                       tsv, websearch_to_tsquery('english', %(qt)s)
+                                   ) DESC
+                               ) AS rank
+                        FROM {self.t.memories}
+                        WHERE {scope_pred}
+                          AND tsv @@ websearch_to_tsquery('english', %(qt)s)
+                        LIMIT %(limit)s
+                    ),
+                    rrf AS (
+                        SELECT COALESCE(v.id, t.id) AS id,
+                               COALESCE(1.0 / (%(k)s + v.rank), 0.0)
+                             + COALESCE(1.0 / (%(k)s + t.rank), 0.0) AS score
+                        FROM vec v FULL JOIN txt t ON v.id = t.id
+                    )
+                    SELECT m.id, m.memory_type, m.content, m.importance,
+                           m.access_count, m.created_at, m.metadata,
+                           NULL::float AS distance, r.score
+                    FROM rrf r
+                    JOIN {self.t.memories} m ON m.id = r.id
+                    ORDER BY r.score DESC
+                    LIMIT %(limit)s
+                    """,
+                    {**base_params, "qvec": _vector_literal(query_embedding), "qt": query_text},
+                    dsn=self._dsn,
+                )
+            except Exception:
+                log.debug(
+                    "memory hybrid recall fell back to vector-only (tsv column missing?)"
+                )
+
         if query_embedding is not None:
             return db.query_all(
                 f"""
@@ -165,25 +262,13 @@ class PgMemoryRepository(_PgBase):
                          * (1.0 - %(iw)s)
                          + importance * %(iw)s AS score
                 FROM {self.t.memories}
-                WHERE tenant_id  = %(tenant)s
-                  AND user_id    = %(user)s
-                  AND project_id = %(project)s
-                  AND persona_id = %(persona)s
-                  AND importance >= %(min_importance)s
+                WHERE {scope_pred}
                   AND embedding IS NOT NULL
                 ORDER BY score DESC
                 LIMIT %(limit)s
                 """,
-                {
-                    "qvec": _vector_literal(query_embedding),
-                    "iw": importance_weight,
-                    "tenant": scope.tenant_id,
-                    "user": scope.user_id,
-                    "project": scope.project_id,
-                    "persona": scope.persona_id,
-                    "min_importance": min_importance,
-                    "limit": limit,
-                },
+                {**base_params, "qvec": _vector_literal(query_embedding),
+                 "iw": importance_weight},
                 dsn=self._dsn,
             )
 
@@ -192,20 +277,11 @@ class PgMemoryRepository(_PgBase):
             SELECT id, memory_type, content, importance, access_count,
                    created_at, metadata, NULL AS distance, importance AS score
             FROM {self.t.memories}
-            WHERE tenant_id  = %s AND user_id = %s
-              AND project_id = %s AND persona_id = %s
-              AND importance >= %s
+            WHERE {scope_pred}
             ORDER BY importance DESC, created_at DESC
-            LIMIT %s
+            LIMIT %(limit)s
             """,
-            (
-                scope.tenant_id,
-                scope.user_id,
-                scope.project_id,
-                scope.persona_id,
-                min_importance,
-                limit,
-            ),
+            base_params,
             dsn=self._dsn,
         )
 
@@ -653,30 +729,35 @@ class PgChunkRepository(_PgBase):
     def add_chunks(self, chunks: Sequence[Mapping[str, Any]]) -> int:
         if not chunks:
             return 0
+        # executemany, not a Python loop of execute(). psycopg 3 pipelines the
+        # batch, so ingesting a 200-chunk document is one round trip rather than
+        # 200 - the difference is seconds on a remote database.
+        rows = [
+            (
+                chunk.get("id") or str(uuid.uuid4()),
+                chunk.get("tenant_id"),
+                chunk.get("project_id"),
+                chunk.get("collection_id"),
+                chunk.get("document_id"),
+                chunk["corpus"],
+                chunk.get("ordinal", 0),
+                chunk.get("title"),
+                chunk["content"],
+                _vector_literal(chunk["embedding"]) if chunk.get("embedding") else None,
+                json.dumps(dict(chunk.get("metadata") or {})),
+            )
+            for chunk in chunks
+        ]
         with db.cursor(self._dsn, dict_rows=False) as cur:
-            for chunk in chunks:
-                embedding = chunk.get("embedding")
-                cur.execute(
-                    f"""
-                    INSERT INTO {self.t.chunks}
-                      (id, tenant_id, project_id, collection_id, document_id,
-                       corpus, ordinal, title, content, embedding, metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, %s::jsonb)
-                    """,
-                    (
-                        chunk.get("id") or str(uuid.uuid4()),
-                        chunk.get("tenant_id"),
-                        chunk.get("project_id"),
-                        chunk.get("collection_id"),
-                        chunk.get("document_id"),
-                        chunk["corpus"],
-                        chunk.get("ordinal", 0),
-                        chunk.get("title"),
-                        chunk["content"],
-                        _vector_literal(embedding) if embedding else None,
-                        json.dumps(dict(chunk.get("metadata") or {})),
-                    ),
-                )
+            cur.executemany(
+                f"""
+                INSERT INTO {self.t.chunks}
+                  (id, tenant_id, project_id, collection_id, document_id,
+                   corpus, ordinal, title, content, embedding, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, %s::jsonb)
+                """,
+                rows,
+            )
         return len(chunks)
 
     def delete_document(self, *, tenant_id: str | None, document_id: str) -> int:
@@ -836,8 +917,8 @@ class PgWorkflowRepository(_PgBase):
             f"""
             INSERT INTO {self.t.workflow_runs}
               (id, tenant_id, project_id, workflow_name, workflow_version,
-               status, principal_id, payload, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, NOW(), NOW())
+               status, principal_id, payload, version, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, 1, NOW(), NOW())
             """,
             (
                 record.run_id,
@@ -863,7 +944,8 @@ class PgWorkflowRepository(_PgBase):
         row = db.query_one(
             f"""
             SELECT id, tenant_id, project_id, workflow_name, workflow_version,
-                   status, principal_id, payload, error, created_at, updated_at
+                   status, principal_id, payload, error, version,
+                   created_at, updated_at
             FROM {self.t.workflow_runs}
             WHERE id = %s AND tenant_id = %s
             """,
@@ -885,6 +967,7 @@ class PgWorkflowRepository(_PgBase):
             error=row["error"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            version=row.get("version", 1),
         )
 
         for srow in db.query_all(
@@ -946,16 +1029,29 @@ class PgWorkflowRepository(_PgBase):
         )
 
     def save_run(self, record: RunRecord) -> None:
+        from ..errors import ConcurrentModificationError
+
         record.updated_at = datetime.now(UTC)
-        db.execute(
+        current_version = record.version
+        rows = db.execute(
             f"""
             UPDATE {self.t.workflow_runs}
-            SET status = %s, error = %s, updated_at = NOW()
-            WHERE id = %s AND tenant_id = %s
+            SET status = %s, error = %s, updated_at = NOW(),
+                version = version + 1
+            WHERE id = %s AND tenant_id = %s AND version = %s
             """,
-            (record.status.value, record.error, record.run_id, record.tenant_id),
+            (
+                record.status.value,
+                record.error,
+                record.run_id,
+                record.tenant_id,
+                current_version,
+            ),
             dsn=self._dsn,
         )
+        if rows == 0:
+            raise ConcurrentModificationError("workflow_run", record.run_id)
+        record.version = current_version + 1
 
 
 def _jsonable(value: Any) -> Any:
