@@ -213,6 +213,26 @@ CREATE INDEX IF NOT EXISTS basis_chunks_scope_idx
 
 -- Vector arm. vector_cosine_ops matches the <=> operator in retrieval.py;
 -- an index built with a different opclass is silently not used.
+--
+-- MEASURED CAVEAT (pgvector 0.8.6, PG 18.6, 20k chunks, vector(1024)):
+-- the planner does NOT choose this index for basis's queries. Every retrieval
+-- filters on (tenant_id, corpus), and with that predicate present Postgres
+-- prefers a Seq Scan (or a Bitmap Heap Scan on basis_chunks_scope_idx) and
+-- sorts the survivors by distance. Confirmed to persist with: no filter at
+-- all, enable_seqscan = off, hnsw.iterative_scan = relaxed_order, and even a
+-- partial HNSW index whose predicate exactly matches the query. The cause is
+-- cost estimation - Postgres prices `<=>` as an ordinary operator and does not
+-- know each evaluation is 1024 multiply-adds, so a full scan looks cheap.
+--
+-- Consequence: vector search is EXACT (recall 10/10) but O(rows), measured at
+-- ~113-140ms per query over 18k in-scope rows, growing linearly. That is fine
+-- up to roughly 50k chunks per tenant and painful beyond it.
+--
+-- If a corpus outgrows that, the fix is to make each scanned set small rather
+-- than to coax the planner: partition basis_chunks by tenant_id, giving each
+-- partition its own index and bounding the scan. Do not drop
+-- basis_chunks_scope_idx to force the issue - the lexical arm and the scope
+-- filter both need it.
 CREATE INDEX IF NOT EXISTS basis_chunks_embedding_idx
     ON basis_chunks USING hnsw (embedding vector_cosine_ops);
 
